@@ -3,7 +3,8 @@ name: autosar-arch-dev
 description: >
   AUTOSAR Classic Platform 架构搭建助手。当用户提到任何与 ARXML 架构修改、SWC 新增、PORT 新增、
   Connector（ASC/DSC）构建、System Data Mapping、需求搭建、Composition 更新、Delegate Port 建立、
-  Router 连接、信号映射、RTE 生成、或 AUTOSAR 架构变更相关的操作时，**必须触发此 skill**。
+  Router 连接、信号映射、RTE 生成、ECU 抽取、ECU Extract、CSXfrm、RIPS 使能、enablerips、
+  或 AUTOSAR 架构变更相关的操作时，**必须触发此 skill**。
   即使用户只说了"搭一下架构"、"改一下 arxml"、"新增一个 port"、"跑一下需求"这类简写，
   也应该使用该 skill。适用于 N80KS VIUMR 域控制器（AURIX TC377）项目的 AUTOSAR Classic Platform 架构开发。
 ---
@@ -26,6 +27,8 @@ description: >
 - System Data Mapping、信号映射、mapping 信号
 - Delegate Port、Composition Port、Router、Router SWC
 - RTE 生成、重新生成 RTE、跑构建、scons
+- ECU 抽取、ECU Extract、ecuextract、FlatMap、FlatView 重新生成
+- CSXfrm、CS_XFRM、RIPS 使能、enablerips、Data Transformation、RTE-PLUGIN-PROPS
 - VIUMR_PPV_COM、VIUMR_COMPO、Composition 更新
 - PORT-API-OPTION、OptionApi
 - 需求包、AchReqPack、需求拆解
@@ -48,6 +51,10 @@ Phase 3: 更新 Composition（替换 SWC → 补充 Interface → 建立 Delegat
 Phase 4: Connector 构建（DSC / ASC）
     ↓
 Phase 5: System Data Mapping
+    ↓
+【条件工序】Gate A: 抽取输入域有变更且需重新生成 RTE？→ Phase 5.5a: ECU 抽取（headless）
+    ↓
+【条件工序】Gate B: 跨 ECU C/S 且配置了 Data Transformation？→ Phase 5.5b: CSXfrm 使能（headless）
     ↓
 Phase 6: 验证（RTE 重新生成 + scons 编译 + 日志记录）
 ```
@@ -178,7 +185,7 @@ Phase 6: 验证（RTE 重新生成 + scons 编译 + 日志记录）
 | 1 | SWC 类型 + PORT-API-OPTION + DataTypeMappingSet 合入 | VIUMR_PPV_COM.arxml |
 | 2 | 新接口（先查重；`_P` 变体放主文件 /Interfaces） | VIUMR_PPV_COM.arxml |
 | 3 | CPT 实例 + Delegate 外口 + ASC/DSC | VIUMR_PPV_COM.arxml |
-| 4 | **FlatView 扁平视图同步**（CPT + 外口 + 全部 connector，上下文路径换为 `/VIU_MR_FlatView/...`） | VIU_MR_FlatView_SWCD.arxml |
+| 4 | **FlatView 扁平视图同步**（CPT + 外口 + 全部 connector，上下文路径换为 `/VIU_MR_FlatView/...`）。**优先级：优先由 Phase 5.5a 工具抽取重新生成 FlatView（方案 B）；本项手动同步仅在 ISOLAR 不可用时作为应急 fallback** | VIU_MR_FlatView_SWCD.arxml |
 | 5 | System Data Mapping | System_Script_*_DataMapping.arxml |
 | 6 | **Rte 任务映射**（RtePositionInTask = 目标任务当前最大值+1 即“放最后”；先脚本扫最大值） | ecu_config/rte/internal/Rte_EcucValues.arxml |
 | 7 | **EcucPartition 登记**（EcucPartitionSoftwareComponentInstanceRef 加入任务所属分区，如 EcucPartitionQM_Core1；漏此项 → RTE 报 E002463） | ecu_config/bsw/VIU_MR_Project_EcuC_EcucValues.arxml |
@@ -244,6 +251,58 @@ ASC_CPT_<ProviderComp>_<ProviderPort>_CPT_<RequesterComp>_<RequesterPort>
 
 ---
 
+## Phase 5.5: ECU 抽取与 CSXfrm 使能（条件工序）
+
+> **条件工序（铁律）**：5.5a 与 5.5b 不是每次必跑，必须先过各自的 Gate 判断，Gate 不通过则直接跳过。
+> **前置配置（铁律）**：两个脚本顶部的 `ISOLAR_A_CMD` 必须先在脚本配置区填入本机 ISOLAR-A.cmd 完整路径，否则脚本直接拒绝运行。
+> **确认机制沿用**：5.5a 产物核验通过后**必须暂停汇报用户**，获得许可后再进 5.5b；5.5b 完成后同样汇报，再进 Phase 6。
+
+### Gate A：是否执行 Phase 5.5a（ECU 抽取）
+
+**判断标准（可操作检查项）**：
+
+1. 本次 Phase 3–5 的变更是否触及**抽取输入域**？即改动文件 ∈ {`VIUMR_PPV_COM.arxml`、`*_DataMapping.arxml`、通信矩阵文件}，也就是 Composition / 连接 / Mapping / 矩阵有变更。
+2. 下一步是否**要重新生成 RTE**？
+
+**两条都成立 → 执行 5.5a。** 只改了 BSW 配置类文件（Com_EcucValues、EcuC EcucValues、Dlt 配套）→ **跳过**，旧 ECU Extract 仍有效。首次抽取为全量，之后工具自动走增量（Iterative）模式。
+
+**调用方式**：
+
+```bat
+python scripts/isolar_extract.py --project=<项目根目录> [--ecu=VIU_MR] [--system=System]
+```
+
+**产物核验要点**（脚本已自动判定，此处为人工复核口径）：
+
+1. 退出码 0，且日志末行出现 `EcuExtract is generated successfully`。
+2. ULF 中无 `<CATEGORY>ERROR</CATEGORY>` 条目。
+3. 三个产物存在：`<ECUInstance>_FlatMap.arxml`、`<ECUInstance>_FlatView_SWCD.arxml`、`<System>_EcuExtr.arxml`（默认落在 `new/` 目录）。
+4. 源 System Description 不会被修改，生成物全是新建元素——若发现源文件被改动，立即停工排查。
+
+### Gate B：是否执行 Phase 5.5b（CSXfrm 使能）
+
+**判断标准（可操作检查项，三条同时成立才执行）**：
+
+1. 本次变更涉及 **Client/Server 接口**；
+2. 该 C/S 通信为**跨 ECU**（intra-ECU C/S 一律跳过）；
+3. 映射的 Signal 配置了 **Data Transformation**（Call/Return 双向）。
+
+**跳过规则**：纯 S/R 信号变更跳过；intra-ECU C/S 跳过；日志报 `No possible FlatInstanceDescriptors` 视为已全部使能（或无满足前提的 FID），**不算错误**，回报人工检查映射即可。
+
+**判据前置沉淀**：Phase 1 需求表中 INTERFACE 为 `CLIENT-SERVER-INTERFACE` 且跨 ECU 的行，即为 5.5b 的目标子集——整理需求表时就应标记出来。
+
+**调用方式**：
+
+```bat
+python scripts/isolar_enablerips.py --project=<项目根目录> --flatmap=VIU_MR_FlatMap [--type=CS_XFRM]
+```
+
+**产物核验要点**：退出码 0 + 日志无异常 + ULF 无 ERROR；事后确认 FlatMap（或 splitfile）中目标 FID 下出现 `RTE-PLUGIN-PROPS`（脚本自动核验并注明核验粒度）。本质是给目标 FID 写入 RTE-PLUGIN-PROPS，RTE 生成时据此挂接 C/S 数据变换插件。
+
+> 详细参数（全部命令行开关、偏好文件、增量抽取条件、ShortName 发现方法），见 `references/isolar_headless.md`。
+
+---
+
 ## Phase 6: 验证与记录
 
 1. **备份**：修改前已执行备份（`arxml_backup.bat`）。
@@ -265,6 +324,8 @@ ASC_CPT_<ProviderComp>_<ProviderPort>_CPT_<RequesterComp>_<RequesterPort>
 | E002411 Unable to resolve reference | 引用路径失效，多为矩阵同步后接口/信号改名残留 | 全工程检索新旧名（含 VIU_MR_FlatMap.arxml 的 upstreamReference、SWC 访问点 TARGET-DATA-PROTOTYPE-REF），统一改为新路径 |
 | E002463 not mapped to partition | SWC 实例 runnable 映射到某 OsApplication 的任务，但实例未登记到对应 EcucPartition | 在 VIU_MR_Project_EcuC_EcucValues.arxml 的对应 EcucPartition 补 EcucPartitionSoftwareComponentInstanceRef |
 | 修复后重跑仍报同样的错 | 工具读了旧模型 | 对比文件 mtime 与日志时间；ISOLAR 中刷新/重开文件后重新生成 |
+| C/S Data Transformation 相关生成错误 | 对应 FID 未使能 CSXfrm，RTE 找不到数据变换插件配置 | 检查 FlatMap 中对应 FID 下是否有 RTE-PLUGIN-PROPS；无 → 重跑 Phase 5.5b（enablerips -t=CS_XFRM） |
+| enablerips 日志报 No possible FlatInstanceDescriptors | 前提不满足（无跨 ECU C/S 或未配 Transformation）或已全部使能 | 不算错误；回报人工检查映射与 Data Transformation 配置，确认后决定是否真正需要使能 |
 
 ---
 
@@ -278,5 +339,6 @@ ASC_CPT_<ProviderComp>_<ProviderPort>_CPT_<RequesterComp>_<RequesterPort>
 | PORT-API-OPTIONS SWC 清单 | `references/port_api_options_list.md` |
 | VIUMR_COMPO.arxml 文件说明 | `references/viumr_compo_guide.md` |
 | 集成模式卡片（Dlt 5 件套 / Router 扩展 / 任务部署 / 分区登记） | `references/integration_patterns.md` |
+| ISOLAR headless 参数手册（ecuextract / enablerips 完整参数与判定） | `references/isolar_headless.md` |
 
 > **提示**：当 skill 触发后，先读取项目根目录下的 `AGENTS.md` 获取最新项目上下文，再根据当前任务阶段读取对应的参考资料。
